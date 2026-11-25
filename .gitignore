@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+/verification/
+/python-surface-*.json
+/dist/*
+!/dist/freeclay-0.1.2.zip
+/tools/probe_*.py
+*.blend
+*.blend[0-9]
+.env
+.env.*
