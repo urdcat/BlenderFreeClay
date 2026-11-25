@@ -112,5 +112,12 @@ Python は Blender のアドオン API・BMesh・スカルプト検証に必要�
 依存は既存の Blender 同梱 `bpy` / `bmesh` / `mathutils` / `gpu` / `numpy` と標準ライブラリだけです。NumPyはGrabの小刻みな変形をまとめて計算し、待ち時間を抑えるために使います。pip・追加 Python・外部 Python パッケージは使用しません。
 梱包・ファイル処理・Windows ワーカー管理は PowerShell と Node.js 標準機能を使います。
 
+## ライセンスと利用上の注意
+
 アドオン本体（`freeclay/`）と配布ZIPは **GPL-3.0-or-later** です。ライセンス本文は [freeclay/LICENSE.txt](freeclay/LICENSE.txt) を参照してください。
 開発補助スクリプトと本文書には、リポジトリの [BSD 2-Clause License](LICENSE) を適用します。
+
+- FreeClayはBlenderのPython APIを使うアドオンです。公開アドオンについてのBlender公式の説明に従い、アドオン本体にはGPLを適用しています。ルートのBSDライセンスは、アドオン本体のGPLを置き換えるものではありません。
+- アドオンの利用・改変・再配布・販売は可能です。アドオン本体やその改変版を配布する場合は、GPLに従って対応するソースコードを提供し、ライセンス・著作権表示などの条件を守る必要があります。販売した場合も、受領者のGPL上の権利は維持されます。
+- **FreeClayを使って作ったモデル・画像などの制作物は、使用したという理由だけでGPLにはなりません。** 制作物の商用利用や別ライセンスでの配布は可能です。ただし、使用した第三者の素材や、制作物に同梱したコードには、それぞれのライセンスが適用されます。
+- ライセンスの条件は各ライセンス本文を参照してください。Blender側の説明は [公式ライセンス案内](https://www.blender.org/about/license/) と [公式FAQ](https://www.blender.org/support/faq/) にあります。
