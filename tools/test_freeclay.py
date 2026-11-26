@@ -128,8 +128,10 @@ def test_scale_cancel_and_session():
         assert not space.overlay.show_stats
         bpy.ops.freeclay.display(kind='STATS')
         assert space.overlay.show_stats
-        for kind in ('GRAB','SMOOTH','CREASE','DRAW','REDUCE'):
+        for kind in ('GRAB','MASK','SMOOTH','CREASE','DRAW','REDUCE'):
             assert bpy.ops.freeclay.brush(kind=kind)=={'FINISHED'}
+            if kind!='REDUCE':assert bpy.context.scene.tool_settings.sculpt.brush.sculpt_brush_type==kind
+            assert bpy.context.workspace.tools.from_space_view3d_mode('SCULPT').idname==('freeclay.grab_tool' if kind=='GRAB' else 'freeclay.mask_tool' if kind=='MASK' else 'freeclay.reduce_tool' if kind=='REDUCE' else 'freeclay.sculpt_tool'),kind
         obj.scale=(1.2,.8,1.5)
         bpy.context.view_layer.update()
         original=[tuple(v.co) for v in obj.data.vertices]

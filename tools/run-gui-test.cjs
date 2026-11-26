@@ -28,7 +28,14 @@ const client=new DesktopClient({hostExecutable:workerPath,configPath,timeoutMs:1
   while(Date.now()-start<55000){
    await new Promise(r=>setTimeout(r,1000));
    if(fs.existsSync(result)){
-    const r=JSON.parse(fs.readFileSync(result,'utf8'));
+    let r;
+    try {r=JSON.parse(fs.readFileSync(result,'utf8'));}
+    catch(error){
+     // Blender may be replacing the progress file at this instant. Reobserve;
+     // do not abort and close the owned app while a test is still running.
+     if(error instanceof SyntaxError)continue;
+     throw error;
+    }
     if('passed' in r){console.log(JSON.stringify(r));completed=true;if(!r.passed)process.exitCode=1;break;}
    }
   }

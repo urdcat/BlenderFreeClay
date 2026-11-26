@@ -1,6 +1,6 @@
 """FreeClay: a small, reversible clay workspace and conservative Reduce brush."""
 bl_info = {'name':'FreeClay — Gentle Reduce', 'author':'FreeClay prototype',
-           'version':(0,1,4), 'blender':(5,2,0), 'category':'Sculpt',
+           'version':(0,1,7), 'blender':(5,2,0), 'category':'Sculpt',
            'description':'Paint away excess topology without smoothing your shape'}
 
 import math
@@ -15,6 +15,7 @@ from gpu_extras.batch import batch_for_shader
 from mathutils import Vector, Quaternion
 from .reducer import Reducer
 from .grab import GrabDeformation
+from . import interaction,parts
 
 _keymaps = []
 _active_strokes = set()
@@ -22,7 +23,7 @@ _active_grabs = set()
 _grab_restore_timers = set()
 
 
-def restore_grab_after_smooth(context):
+def restore_grab_after_smooth(context,target_tool='freeclay.grab_tool'):
     window=context.window;area=context.area;region=context.region;obj=context.object
     def restore():
         try:
@@ -31,8 +32,8 @@ def restore_grab_after_smooth(context):
             with bpy.context.temp_override(window=window,area=area,region=region):
                 if bpy.context.object==obj and obj.mode=='SCULPT' and owned(bpy.context):
                     tool=bpy.context.workspace.tools.from_space_view3d_mode('SCULPT')
-                    if tool and tool.idname=='freeclay.sculpt_tool':
-                        bpy.ops.wm.tool_set_by_id(name='freeclay.grab_tool')
+                    if tool and tool.idname in {'freeclay.sculpt_tool','builtin_brush.mask'}:
+                        bpy.ops.wm.tool_set_by_id(name=target_tool)
                         hide_shelf(bpy.context)
         except (ReferenceError,RuntimeError):
             pass
@@ -70,14 +71,21 @@ def hide_shelf(context):
 
 
 class FreeClaySettings(bpy.types.PropertyGroup):
-    grab_strength: FloatProperty(name='Grabの強さ',default=1,min=0,max=1,subtype='FACTOR',
+    transform_target: EnumProperty(name='操作対象',items=[('BRUSH','ブラシ範囲','範囲とマスクに従って変形'),('OBJECT','部品全体（FIX）','形を保ち、ワールド軸で移動・回転・拡大縮小')],default='BRUSH',update=interaction.redraw)
+    transform_kind: EnumProperty(items=[('GRAB','移動',''),('ROTATE','回転',''),('SCALE','拡大縮小','')],default='GRAB')
+    part_index: IntProperty(default=0)
+    size_mode: EnumProperty(name='範囲の基準（全ブラシ共通）',items=[('SCREEN','画面基準','画面上の半径を保ちます。寄るほど細部を扱えます'),
+                               ('MODEL','モデル基準','モデル上の半径を保ちます。ズームで円の見た目が変わります')],default='SCREEN',update=interaction.sync_size_mode)
+    grab_radius_px: FloatProperty(name='Grab半径（px）',default=100,min=4,max=4000,soft_max=400,precision=0,update=interaction.redraw)
+    reduce_diameter: FloatProperty(name='Reduce範囲（初期サイズ比）',default=.4,min=.005,max=20,soft_max=2,update=interaction.redraw)
+    grab_strength: FloatProperty(name='Grabの移動量',default=.35,min=0,max=1,soft_max=1,step=1,subtype='FACTOR',
                                  description='1.0でつかんだ頂点がカーソルに追従します（マスクと対称面の制約を除く）')
     grab_diameter: FloatProperty(name='Grabの範囲（初期サイズ比）',default=.8,min=.01,max=20,
-                                 soft_min=.05,soft_max=20,precision=2,
+                                 soft_min=.01,soft_max=2,precision=3,step=1,update=interaction.redraw,
                                  description='1.0＝開始時モデルの直径、5.0＝5倍。ズームで変わりません')
     grab_pressure: BoolProperty(name='Grabに筆圧を使う',default=False,
                                description='押し始めの筆圧で強さを調整します。オフなら設定した強さで引っ張ります')
-    radius: IntProperty(name='大きさ', default=75, min=8, max=400, subtype='PIXEL')
+    radius: IntProperty(name='大きさ', default=75, min=8, max=400, subtype='PIXEL',update=interaction.redraw)
     strength: FloatProperty(name='効き具合', default=0.55, min=0.05, max=1, subtype='FACTOR')
     preserve: FloatProperty(name='形を守る', default=0.8, min=0.1, max=1, subtype='FACTOR')
     pressure: BoolProperty(name='筆圧で効きを変える', default=True)
@@ -105,16 +113,40 @@ def load_brush(context, name, kind):
         brush.sculpt_brush_type = kind
         brush.asset_mark()
         brush.use_fake_user = True
-        brush.size = 75
+        brush.size = 100
+        brush.unprojected_size=reference_diameter(context.object)*.15
         brush.strength = 0.35 if kind!='SMOOTH' else 0.45
         brush.spacing = 8
         brush.use_pressure_strength = True
         brush.use_pressure_size = False
         brush.use_space_attenuation = True
+        if kind=='MASK':
+            brush.strength=1
+            brush.use_frontface=True
+            brush.use_space_attenuation=False
+            brush.curve_distance_falloff_preset='CONSTANT'
+    sculpt=context.scene.tool_settings.sculpt
+    if 'freeclay_previous_unified_size' not in context.object:
+        context.object['freeclay_previous_unified_size']=sculpt.unified_paint_settings.use_unified_size
+    sculpt.unified_paint_settings.use_unified_size=False
+    if 'freeclay_previous_unified_strength' not in context.object:
+        context.object['freeclay_previous_unified_strength']=sculpt.unified_paint_settings.use_unified_strength
+    sculpt.unified_paint_settings.use_unified_strength=False
+    brush.use_locked_size='VIEW' if context.scene.freeclay.size_mode=='SCREEN' else 'SCENE'
     bpy.ops.brush.asset_activate(asset_library_type='LOCAL', relative_asset_identifier='Brush/'+brush.name)
-    bpy.ops.wm.tool_set_by_id(name='freeclay.grab_tool' if kind=='GRAB' else 'freeclay.sculpt_tool')
+    bpy.ops.wm.tool_set_by_id(name='freeclay.grab_tool' if kind=='GRAB' else 'freeclay.mask_tool' if kind=='MASK' else 'freeclay.sculpt_tool')
     if kind=='GRAB':
         reference_diameter(context.object)
+        if context.object.use_dynamic_topology_sculpting:
+            bpy.ops.sculpt.dynamic_topology_toggle('EXEC_DEFAULT',False)
+    if kind=='MASK':
+        saved=json.loads(context.object.get('freeclay_view_before','{}'))
+        for name in ('show_sculpt_mask','sculpt_mode_mask_opacity','show_overlays'):
+            saved.setdefault('overlay.'+name,getattr(context.space_data.overlay,name))
+        context.object['freeclay_view_before']=json.dumps(saved)
+        context.space_data.overlay.show_overlays=True
+        context.space_data.overlay.show_sculpt_mask=True
+        context.space_data.overlay.sculpt_mode_mask_opacity=.8
     hide_shelf(context)
     return brush
 
@@ -123,13 +155,18 @@ class FREECLAY_OT_brush(bpy.types.Operator):
     bl_idname = 'freeclay.brush'
     bl_label = 'FreeClay Brush'
     kind: EnumProperty(items=[('DRAW','盛る',''),('GRAB','つかむ',''),('SMOOTH','ならす',''),
-                              ('CREASE','溝',''),('REDUCE','軽くする','')], default='REDUCE')
+                              ('CREASE','溝',''),('REDUCE','軽くする',''),('MASK','マスク',''),('ROTATE','回転',''),('SCALE','拡大縮小','')], default='REDUCE')
 
     @classmethod
     def poll(cls,context):
         return sculpt_context(context)
 
     def execute(self,context):
+        if self.kind in {'ROTATE','SCALE'}:
+            load_brush(context,'Grab','GRAB')
+            context.scene.freeclay.transform_kind=self.kind
+            bpy.ops.wm.tool_set_by_id(name='freeclay.transform_tool')
+            return {'FINISHED'}
         if self.kind == 'REDUCE':
             bpy.ops.wm.tool_set_by_id(name='freeclay.reduce_tool')
             hide_shelf(context)
@@ -224,6 +261,7 @@ class FREECLAY_OT_clay(bpy.types.Operator):
         obj['freeclay_previous_detail']=json.dumps({name:getattr(sculpt,name) for name in
                                                    ('detail_type_method','detail_refine_method','detail_percent')})
         obj['freeclay_enabled']=True
+        obj['freeclay_part']=True;obj['freeclay_group']=False
         # No preference changes; brushes, mode and keymaps are local to FreeClay.
         load_brush(context,'Draw','DRAW')
         sync_symmetry(context.scene.freeclay,context)
@@ -264,6 +302,10 @@ class FREECLAY_OT_leave(bpy.types.Operator):
             setattr(sculpt,'use_symmetry_'+axis,value)
         for name,value in json.loads(obj.get('freeclay_previous_detail','{}')).items():
             setattr(sculpt,name,value)
+        if 'freeclay_previous_unified_size' in obj:
+            sculpt.unified_paint_settings.use_unified_size=obj['freeclay_previous_unified_size']
+        if 'freeclay_previous_unified_strength' in obj:
+            sculpt.unified_paint_settings.use_unified_strength=obj['freeclay_previous_unified_strength']
         source=bpy.data.objects.get(obj.get('freeclay_source',''))
         if source:
             source.hide_set(obj.get('freeclay_source_hidden',False))
@@ -300,7 +342,7 @@ class FREECLAY_OT_symmetrize(bpy.types.Operator):
 
 class Stroke:
     """Transaction shared by interactive brush and headless integration tests."""
-    def __init__(self,context,build_reducer=True):
+    def __init__(self,context,build_reducer=True,checkpoint=False):
         self.obj=context.object
         self.mesh=self.obj.data
         self.was_sculpt=self.obj.mode=='SCULPT'
@@ -314,6 +356,9 @@ class Stroke:
             raise ValueError('モディファイア付きモデルは「粘土として開く（コピー）」を使ってください')
         if self.was_dyntopo:
             bpy.ops.sculpt.dynamic_topology_toggle('EXEC_DEFAULT',False)
+        if checkpoint:
+            # Capture geometry as well as any previous native mask-only undo step.
+            bpy.ops.ed.undo_push(message='FreeClay edit start')
         if self.was_sculpt:
             bpy.ops.object.mode_set('EXEC_DEFAULT',False,mode='OBJECT')
         try:
@@ -392,7 +437,7 @@ class FREECLAY_OT_reduce(bpy.types.Operator):
 
     def _begin(self,context):
         if self._stroke is None:
-            self._stroke=Stroke(context)
+            self._stroke=Stroke(context,checkpoint=True)
 
     def _paint(self,context,event=None):
         settings=context.scene.freeclay
@@ -404,10 +449,11 @@ class FREECLAY_OT_reduce(bpy.types.Operator):
         if location is None:
             self._last=None
             return
-        edge=view3d_utils.region_2d_to_location_3d(self._region,self._rv3d,
-                                                 self._mouse+Vector((settings.radius,0)),location)
-        radius=(edge-location).length
-        if self._last is not None and (self._mouse-self._last).length < settings.radius*0.12:
+        radius=interaction.radius_world(context,location,'REDUCE')
+        interaction.remember(context,location)
+        projected=view3d_utils.location_3d_to_region_2d(self._region,self._rv3d,location+self._rv3d.view_rotation@Vector((radius,0,0)))
+        pixel_radius=(projected-self._mouse).length if projected is not None else settings.radius
+        if self._last is not None and (self._mouse-self._last).length < pixel_radius*0.12:
             return
         self._stroke.dab(location,radius,direction,settings.strength*self._pressure,
                          settings.preserve,settings.symmetry)
@@ -425,7 +471,9 @@ class FREECLAY_OT_reduce(bpy.types.Operator):
                 return {'FINISHED'}
             if event.type in {'WHEELUPMOUSE','WHEELDOWNMOUSE'}:
                 settings=context.scene.freeclay
-                settings.radius=round(settings.radius*(1.1 if event.type=='WHEELUPMOUSE' else 1/1.1))
+                factor=1.1 if event.type=='WHEELUPMOUSE' else 1/1.1
+                if settings.size_mode=='SCREEN':settings.radius=round(settings.radius*factor)
+                else:settings.reduce_diameter*=factor
                 self._context_area.tag_redraw()
                 return {'RUNNING_MODAL'}
             if event.type=='LEFTMOUSE':
@@ -461,11 +509,15 @@ class FREECLAY_OT_reduce(bpy.types.Operator):
                 or bpy.context.region.as_pointer()!=self._region_pointer):
             return
         radius=context.scene.freeclay.radius
+        if context.scene.freeclay.size_mode=='MODEL':
+            circles=interaction.circles(bpy.context,'REDUCE')
+            if circles:radius=circles[0][1]
         pts=[(self._mouse.x+math.cos(i*math.tau/64)*radius,
               self._mouse.y+math.sin(i*math.tau/64)*radius) for i in range(65)]
         shader=gpu.shader.from_builtin('UNIFORM_COLOR')
         gpu.state.blend_set('ALPHA')
         try:
+            if self._last is not None and interaction.draw_joined(bpy.context,'REDUCE',(0.35,0.9,0.72,0.85)):return
             shader.bind(); shader.uniform_float('color',(0.35,0.9,0.72,0.85))
             batch_for_shader(shader,'LINE_STRIP',{'pos':pts}).draw(shader)
         finally:
@@ -558,13 +610,12 @@ class FREECLAY_WST_reduce(bpy.types.WorkSpaceTool):
     @staticmethod
     def draw_settings(context,layout,tool):
         s=context.scene.freeclay
-        layout.prop(s,'radius'); layout.prop(s,'strength'); layout.prop(s,'preserve')
+        layout.prop(s,'radius' if s.size_mode=='SCREEN' else 'reduce_diameter'); layout.prop(s,'strength'); layout.prop(s,'preserve')
 
     @staticmethod
     def draw_cursor(context,tool,xy):
         if not _active_strokes and owned(context):
-            from gpu_extras.presets import draw_circle_2d
-            draw_circle_2d(xy,(0.35,0.9,0.72,0.85),context.scene.freeclay.radius,segments=64)
+            interaction.capture_cursor(context,xy)
 
 
 class FREECLAY_OT_sculpt_stroke(bpy.types.Operator):
@@ -577,9 +628,14 @@ class FREECLAY_OT_sculpt_stroke(bpy.types.Operator):
 
     def invoke(self,context,event):
         brush=context.scene.tool_settings.sculpt.brush
-        if brush and brush.sculpt_brush_type=='GRAB' and not event.shift:
-            result=bpy.ops.freeclay.grab('INVOKE_DEFAULT')
+        kind=interaction.active_kind(context)
+        if kind in {'GRAB','ROTATE','SCALE'} and not event.shift:
+            result=(bpy.ops.freeclay.grab('INVOKE_DEFAULT') if kind=='GRAB' and context.scene.freeclay.transform_target=='BRUSH'
+                    else bpy.ops.freeclay.transform('INVOKE_DEFAULT',kind=kind))
             return {'FINISHED'} if 'RUNNING_MODAL' in result else result
+        previous_tool=context.workspace.tools.from_space_view3d_mode('SCULPT').idname
+        temporary_mask=bool(brush and brush.sculpt_brush_type=='MASK')
+        if temporary_mask:bpy.ops.wm.tool_set_by_id(name='builtin_brush.mask')
         temporary_grab=bool(brush and brush.sculpt_brush_type=='GRAB' and event.shift)
         if temporary_grab:
             # Native Smooth requires a brush-enabled tool. Restore the compact
@@ -587,15 +643,22 @@ class FREECLAY_OT_sculpt_stroke(bpy.types.Operator):
             bpy.ops.wm.tool_set_by_id(name='freeclay.sculpt_tool')
         # Keep Reduce's undo checkpoint in the regular mesh undo domain.
         # Re-enter Dyntopo only when the next actual sculpt stroke begins.
-        if context.scene.freeclay.auto_detail and not context.object.use_dynamic_topology_sculpting:
+        if brush and brush.sculpt_brush_type=='MASK' and context.object.use_dynamic_topology_sculpting:
+            bpy.ops.sculpt.dynamic_topology_toggle('EXEC_DEFAULT',False)
+        if context.scene.freeclay.auto_detail and brush and brush.sculpt_brush_type!='MASK' and not context.object.use_dynamic_topology_sculpting:
+            # Undo or another sculpt session can restore Blender's collapse mode.
+            # FreeClay adds detail here; only Reduce is allowed to remove it.
+            sculpt=context.scene.tool_settings.sculpt
+            sculpt.detail_type_method='BRUSH'
+            sculpt.detail_refine_method='SUBDIVIDE'
             bpy.ops.sculpt.dynamic_topology_toggle('EXEC_DEFAULT',False)
         try:
             result=bpy.ops.sculpt.brush_stroke('INVOKE_DEFAULT',
                                               mode='INVERT' if event.ctrl else 'NORMAL',
                                               brush_toggle='SMOOTH' if event.shift else 'None')
         finally:
-            if temporary_grab:
-                restore_grab_after_smooth(context)
+            if temporary_grab or temporary_mask:
+                restore_grab_after_smooth(context,previous_tool)
         return {'FINISHED'} if 'RUNNING_MODAL' in result or 'FINISHED' in result else {'CANCELLED'}
 
 
@@ -608,6 +671,24 @@ class FREECLAY_WST_sculpt(bpy.types.WorkSpaceTool):
     bl_icon='brush.sculpt.draw'
     bl_options={'USE_BRUSHES'}
     bl_keymap=(('freeclay.sculpt_stroke',{'type':'LEFTMOUSE','value':'PRESS','any':True},None),)
+
+    @staticmethod
+    def draw_cursor(context,tool,xy):
+        if owned(context):interaction.capture_cursor(context,xy)
+
+
+class FREECLAY_WST_mask(bpy.types.WorkSpaceTool):
+    bl_space_type='VIEW_3D';bl_context_mode='SCULPT'
+    bl_idname='freeclay.mask_tool';bl_label='マスク';bl_icon='brush.sculpt.mask'
+    bl_keymap=(('freeclay.sculpt_stroke',{'type':'LEFTMOUSE','value':'PRESS','any':True},None),)
+    @staticmethod
+    def draw_cursor(context,tool,xy):
+        if owned(context):interaction.capture_cursor(context,xy)
+    @staticmethod
+    def draw_settings(context,layout,tool):
+        brush=context.scene.tool_settings.sculpt.brush
+        layout.prop(brush,'size' if context.scene.freeclay.size_mode=='SCREEN' else 'unprojected_size',text='マスク直径')
+        layout.prop(brush,'strength')
 
 
 class FREECLAY_OT_grab(bpy.types.Operator):
@@ -625,7 +706,7 @@ class FREECLAY_OT_grab(bpy.types.Operator):
         if self.region.type!='WINDOW' or self.rv is None:
             return {'CANCELLED'}
         try:
-            self.stroke=Stroke(context,build_reducer=False)
+            self.stroke=Stroke(context,build_reducer=False,checkpoint=True)
             obj=self.stroke.obj
             mouse=Vector((event.mouse_region_x,event.mouse_region_y))
             origin=view3d_utils.region_2d_to_origin_3d(self.region,self.rv,mouse)
@@ -641,7 +722,8 @@ class FREECLAY_OT_grab(bpy.types.Operator):
             self.strength=s.grab_strength
             if s.grab_pressure and getattr(event,'is_tablet',False):
                 self.strength*=max(0,min(1,event.pressure))
-            radius=reference_diameter(obj)*s.grab_diameter*.5
+            radius=interaction.radius_world(context,self.anchor,'GRAB')
+            interaction.remember(context,self.anchor)
             self.deformation=GrabDeformation(obj.data,obj.matrix_world,self.anchor,radius,s.symmetry)
             _active_grabs.add(self)
             context.window_manager.modal_handler_add(self)
@@ -676,6 +758,7 @@ class FREECLAY_OT_grab(bpy.types.Operator):
             if self.stroke:
                 self.stroke.finish(context,cancel);self.stroke=None
         finally:
+            if getattr(self,'deformation',None):self.deformation.close()
             _active_grabs.discard(self)
             self.area.header_text_set(None);self.area.tag_redraw()
 
@@ -695,28 +778,14 @@ class FREECLAY_WST_grab(bpy.types.WorkSpaceTool):
     @staticmethod
     def draw_settings(context,layout,tool):
         layout.prop(context.scene.freeclay,'grab_strength')
-        layout.prop(context.scene.freeclay,'grab_diameter')
+        if context.scene.freeclay.transform_target=='BRUSH':
+            layout.prop(context.scene.freeclay,'grab_radius_px' if context.scene.freeclay.size_mode=='SCREEN' else 'grab_diameter')
 
     @staticmethod
     def draw_cursor(context,tool,xy):
         if not owned(context) or _active_grabs or _active_strokes:
             return
-        from gpu_extras.presets import draw_circle_2d
-        region=context.region;rv=context.region_data
-        if region is None or rv is None:
-            return
-        mouse=Vector((xy[0]-region.x,xy[1]-region.y))
-        origin=view3d_utils.region_2d_to_origin_3d(region,rv,mouse)
-        direction=view3d_utils.region_2d_to_vector_3d(region,rv,mouse)
-        obj=context.object;inv=obj.matrix_world.inverted()
-        hit,location,_,_=obj.ray_cast(inv@origin,(inv.to_3x3()@direction).normalized())
-        depth=obj.matrix_world@location if hit else obj.matrix_world.translation
-        radius=reference_diameter(obj)*context.scene.freeclay.grab_diameter*.5
-        right=rv.view_rotation@Vector((radius,0,0))
-        a=view3d_utils.location_3d_to_region_2d(region,rv,depth)
-        b=view3d_utils.location_3d_to_region_2d(region,rv,depth+right)
-        if a is not None and b is not None:
-            draw_circle_2d(xy,(1,.65,.25,.85),(b-a).length,segments=96)
+        interaction.capture_cursor(context,xy)
 
 
 class FREECLAY_OT_display(bpy.types.Operator):
@@ -762,39 +831,58 @@ class FREECLAY_PT_panel(bpy.types.Panel):
 
     def draw(self,context):
         layout=self.layout
+        parts.draw_panel(context,layout)
         if not owned(context) or not context.object.get('freeclay_previous_detail'):
             layout.label(text='触って、形をつくる。')
             layout.operator('freeclay.open_clay',text='新しい粘土',icon='MESH_UVSPHERE').new_sphere=True
             layout.operator('freeclay.open_clay',icon='DUPLICATE')
             layout.prop(context.scene.freeclay,'auto_detail')
             return
-        col=layout.column(align=True)
+        col=layout.grid_flow(columns=2,align=True)
         for kind,label in [('DRAW','盛る  ·  D'),('GRAB','つかむ  ·  G'),('SMOOTH','ならす  ·  S'),
-                           ('CREASE','溝  ·  C'),('REDUCE','軽くする  ·  Q')]:
+                           ('CREASE','溝  ·  C'),('REDUCE','軽くする  ·  Q'),('MASK','マスク  ·  M'),('ROTATE','回転'),('SCALE','拡大縮小')]:
             col.operator('freeclay.brush',text=label).kind=kind
         layout.separator()
         space=context.space_data
         box=layout.box()
         box.label(text='表示')
-        box.operator('freeclay.display',text='ソリッド＋ワイヤー',icon='SHADING_WIRE',
+        row=box.row(align=True)
+        row.operator('freeclay.display',text='ワイヤー',icon='SHADING_WIRE',
                      depress=space.overlay.show_overlays and space.overlay.show_wireframes and space.shading.type=='SOLID').kind='WIRE'
-        box.operator('freeclay.display',text='頂点数・面数',icon='INFO',
+        row.operator('freeclay.display',text='頂点・面数',icon='INFO',
                      depress=space.overlay.show_overlays and space.overlay.show_stats).kind='STATS'
         s=context.scene.freeclay
+        kind=interaction.active_kind(context)
         box=layout.box()
-        box.label(text='Grab · つかむ')
-        box.prop(s,'grab_strength');box.prop(s,'grab_diameter');box.prop(s,'grab_pressure')
-        layout.label(text='Reduce · 軽くする')
-        layout.prop(s,'radius'); layout.prop(s,'strength'); layout.prop(s,'preserve')
-        layout.prop(s,'pressure'); layout.prop(s,'symmetry')
+        box.label(text='範囲の基準 · 全ブラシ共通')
+        box.row(align=True).prop(s,'size_mode',expand=True)
+        row=box.row();row.enabled=not (kind in {'GRAB','ROTATE','SCALE'} and s.transform_target=='OBJECT')
+        row.operator('freeclay.brush_size',text='範囲を見ながら調整 · F')
+        if kind in {'GRAB','ROTATE','SCALE'}:
+            box=layout.box();box.label(text='移動・回転・拡大縮小')
+            box.row(align=True).prop(s,'transform_target',expand=True)
+            box.prop(s,'grab_strength',text='移動量' if kind=='GRAB' else '操作量')
+            if s.transform_target=='BRUSH':
+                box.prop(s,'grab_radius_px' if s.size_mode=='SCREEN' else 'grab_diameter',text='範囲半径（px）' if s.size_mode=='SCREEN' else '範囲（初期サイズ比）')
+                if kind=='GRAB':box.prop(s,'grab_pressure')
+        if kind=='REDUCE':
+            layout.label(text='Reduce · 軽くする')
+            layout.prop(s,'radius' if s.size_mode=='SCREEN' else 'reduce_diameter'); layout.prop(s,'strength'); layout.prop(s,'preserve')
+            layout.prop(s,'pressure')
+        brush=context.scene.tool_settings.sculpt.brush
+        if brush and kind not in {'GRAB','REDUCE','ROTATE','SCALE'}:
+            layout.prop(brush,'size' if s.size_mode=='SCREEN' else 'unprojected_size',text='通常ブラシの直径')
+            layout.prop(brush,'strength',text='効き具合')
+        if brush and kind=='MASK':
+            box=layout.box();box.label(text='塗る: 保護 / Ctrl: 消す / Shift: ぼかす')
+            box.operator('paint.mask_flood_fill',text='マスク反転').mode='INVERT'
+            clear=box.operator('paint.mask_flood_fill',text='マスクを全解除');clear.mode='VALUE';clear.value=0
+        layout.prop(s,'symmetry')
         if s.symmetry:
             layout.operator('freeclay.symmetrize')
-        layout.label(text='Rを押して一筆だけ軽くする')
-        layout.label(text='Space: 手元のブラシメニュー')
-        layout.label(text='右ドラッグ: 物体中心で回転')
-        layout.label(text='中ドラッグ: 触った位置で回転')
-        layout.label(text='Shift + 右 / 中: 平行移動')
-        layout.label(text='Ctrl Z: 戻す / Esc: 一筆を取消')
+        layout.label(text='F: 範囲 / R: 一筆Reduce / M: マスク')
+        layout.label(text='右: 物体中心 / 中: 触った位置で回転')
+        layout.label(text='Ctrl Z: 戻す / Esc: 取消')
         layout.operator('freeclay.leave')
 
 
@@ -805,7 +893,7 @@ class FREECLAY_MT_brushes(bpy.types.Menu):
     def draw(self,context):
         pie=self.layout.menu_pie()
         for kind,label in [('GRAB','つかむ'),('REDUCE','軽くする'),('SMOOTH','ならす'),
-                           ('DRAW','盛る'),('CREASE','溝')]:
+                           ('DRAW','盛る'),('CREASE','溝'),('MASK','マスク'),('ROTATE','回転'),('SCALE','拡大縮小')]:
             pie.operator('freeclay.brush',text=label).kind=kind
 
 
@@ -832,13 +920,16 @@ def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.freeclay=PointerProperty(type=FreeClaySettings)
+    interaction.register()
     bpy.utils.register_tool(FREECLAY_WST_reduce,separator=True,group=False)
     bpy.utils.register_tool(FREECLAY_WST_sculpt,after={'freeclay.reduce_tool'},group=False)
     bpy.utils.register_tool(FREECLAY_WST_grab,after={'freeclay.sculpt_tool'},group=False)
+    bpy.utils.register_tool(FREECLAY_WST_mask,after={'freeclay.grab_tool'},group=False)
+    parts.register()
     config=bpy.context.window_manager.keyconfigs.addon
     if config:
         km=config.keymaps.new(name='Sculpt',space_type='EMPTY')
-        for key,kind in [('D','DRAW'),('G','GRAB'),('S','SMOOTH'),('C','CREASE'),('Q','REDUCE')]:
+        for key,kind in [('D','DRAW'),('G','GRAB'),('S','SMOOTH'),('C','CREASE'),('Q','REDUCE'),('M','MASK')]:
             kmi=km.keymap_items.new('freeclay.brush',key,'PRESS')
             kmi.properties.kind=kind
             _keymaps.append((km,kmi))
@@ -846,6 +937,7 @@ def register():
         kmi.properties.temporary=True
         _keymaps.append((km,kmi))
         _keymaps.append((km,km.keymap_items.new('freeclay.menu','SPACE','PRESS')))
+        _keymaps.append((km,km.keymap_items.new('freeclay.brush_size','F','PRESS')))
         for button in ('RIGHTMOUSE','MIDDLEMOUSE'):
             for shift in (False,True):
                 kmi=km.keymap_items.new('freeclay.navigate',button,'PRESS',shift=shift)
@@ -855,6 +947,8 @@ def register():
 
 
 def unregister():
+    parts.unregister()
+    interaction.unregister()
     for callback in list(_grab_restore_timers):
         if bpy.app.timers.is_registered(callback):
             bpy.app.timers.unregister(callback)
@@ -869,6 +963,7 @@ def unregister():
     bpy.utils.unregister_tool(FREECLAY_WST_reduce)
     bpy.utils.unregister_tool(FREECLAY_WST_sculpt)
     bpy.utils.unregister_tool(FREECLAY_WST_grab)
+    bpy.utils.unregister_tool(FREECLAY_WST_mask)
     del bpy.types.Scene.freeclay
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)

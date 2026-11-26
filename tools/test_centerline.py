@@ -12,7 +12,7 @@ if '--previous' in sys.argv:
         previous=types.ModuleType('previous_grab')
         exec(compile(archive.read('grab.py'),'freeclay-0.1.1.zip/grab.py','exec'),previous.__dict__)
         GrabDeformation=previous.GrabDeformation
-report={'version':bpy.app.version_string,'implementation':'0.1.1' if '--previous' in sys.argv else '0.1.2',
+report={'version':bpy.app.version_string,'implementation':'0.1.1' if '--previous' in sys.argv else 'current',
         'numpy':{'version':np.__version__,'path':np.__file__,'init_sha256':hashlib.sha256(pathlib.Path(np.__file__).read_bytes()).hexdigest()},'checks':[]}
 try:
     for kind in ('plane','sphere'):

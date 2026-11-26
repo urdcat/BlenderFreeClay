@@ -5,6 +5,9 @@ __pycache__/
 /dist/*
 !/dist/freeclay-0.1.2.zip
 !/dist/freeclay-0.1.4.zip
+!/dist/freeclay-0.1.5.zip
+!/dist/freeclay-0.1.6.zip
+!/dist/freeclay-0.1.7.zip
 /tools/probe_*.py
 *.blend
 *.blend[0-9]

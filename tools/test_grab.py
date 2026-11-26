@@ -12,7 +12,7 @@ step=0; case=0; start=None; origin=None; vertex_id=None; obj_name=None;original=
 cases=[('custom-low',.35,.8,False),('custom-full',1,.8,False),
        ('custom-wide',1,5,False),('custom-wide-symmetry',1,5,True),
        ('custom-maximum-range',1,20,True),('custom-cancel',1,5,True),
-       ('center-straight',1,.3,True),('center-inward',1,.3,True),('center-outward',1,.3,True)]
+       ('center-straight',1,.3,True),('center-inward',1,.3,True),('center-outward',1,.3,True),('center-long',1,.3,True),('center-long-cancel',1,.3,True)]
 
 def save():
     (out/'result.json').write_text(json.dumps(report,indent=2),encoding='utf8')
@@ -30,12 +30,16 @@ def tick():
                 window.event_simulate(type='ESC',value='RELEASE')
                 freeclay.register()
                 bpy.context.scene.freeclay.auto_detail=False
+                bpy.context.scene.freeclay.size_mode='MODEL'
             phase=(step-1)%15
             case=(step-1)//15
             if step>0 and case<len(cases):
                 label,strength,size_ratio,symmetry=cases[case]
                 central=label.startswith('center-')
+                cancel=label.endswith('-cancel')
                 motion=(0 if label=='center-straight' else -20 if label=='center-inward' else 20,60) if central else (60,0)
+                if label.startswith('center-long'):motion=(0,240)
+                pointer_distance=motion[1] if central else motion[0]
                 if phase==0:
                     if bpy.context.object and bpy.context.object.mode!='OBJECT':
                         bpy.ops.object.mode_set(mode='OBJECT')
@@ -65,7 +69,7 @@ def tick():
                     fraction=(phase-3)/6
                     window.event_simulate(type='MOUSEMOVE',value='NOTHING',x=round(start[0]+motion[0]*fraction),y=round(start[1]+motion[1]*fraction))
                 elif phase==10:
-                    if label=='custom-cancel':
+                    if cancel:
                         obj=bpy.data.objects[obj_name]
                         assert (obj.data.vertices[vertex_id].co-origin).length>.01
                         window.event_simulate(type='ESC',value='PRESS',x=start[0]+60,y=start[1])
@@ -75,9 +79,9 @@ def tick():
                     a=location_3d_to_region_2d(region,rv,origin)
                     b=location_3d_to_region_2d(region,rv,obj.data.vertices[vertex_id].co)
                     displacement=b.y-a.y if central else b.x-a.x
-                    gain=displacement/60
+                    gain=displacement/pointer_distance
                     report['checks'].append({'case':label,'strength':strength,'diameter_ratio':size_ratio,
-                        'symmetry':symmetry,'pointer_px':60,'vertex_px':displacement,'gain':gain})
+                        'symmetry':symmetry,'pointer_px':pointer_distance,'vertex_px':displacement,'gain':gain,'vertices':len(obj.data.vertices)})
                     if central:
                         from mathutils.bvhtree import BVHTree
                         mesh=obj.data
@@ -88,27 +92,30 @@ def tick():
                         collapsed=sum(abs(p[0])>1e-7 and abs(v.co.x)<1e-9 for v,p in zip(mesh.vertices,original))
                         report['checks'].append({'case':label,'nonadjacent_intersections':crossings,'degenerate':degenerate,'collapsed_to_seam':collapsed})
                         assert crossings==degenerate==collapsed==0
-                    expected=0 if label=='custom-cancel' else strength
+                    expected=0 if cancel else strength
                     assert abs(gain-expected)<.03,(label,gain,expected)
                     assert obj.mode=='SCULPT' and not freeclay._active_grabs
-                    if label=='custom-cancel':
+                    if cancel:
                         assert [tuple(v.co) for v in obj.data.vertices]==original
                     else:
                         bpy.ops.ed.undo()
-                elif phase==12 and label!='custom-cancel':
+                elif phase==12 and not cancel:
                     obj=bpy.data.objects[obj_name]
                     assert [tuple(v.co) for v in obj.data.vertices]==original,'Grab undo did not restore geometry'
                     report['checks'].append({'case':label,'undo_restores':True})
                     bpy.ops.ed.redo()
-                elif phase==13 and label!='custom-cancel':
+                elif phase==13 and not cancel:
                     obj=bpy.data.objects[obj_name]
                     a=location_3d_to_region_2d(region,rv,origin)
                     b=location_3d_to_region_2d(region,rv,obj.data.vertices[vertex_id].co)
                     displacement=b.y-a.y if central else b.x-a.x
-                    assert abs(displacement/60-strength)<.03,'Grab redo did not restore geometry'
+                    assert abs(displacement/pointer_distance-strength)<.03,'Grab redo did not restore geometry'
                     report['checks'].append({'case':label,'redo_restores':True})
                 elif phase==14 and label=='custom-full':
                     bpy.ops.screen.screenshot(filepath=str(out/'grab-controls.png'))
+                elif phase==14 and label=='center-long':
+                    bpy.ops.screen.screenshot(filepath=str(out/'long-grab.png'))
+                    bpy.ops.wm.save_as_mainfile(filepath=str(out/'long-grab.blend'))
             if case>=len(cases):
                 report['passed']=True;save();return None
         step+=1;save();return .15 if step>1 else 1

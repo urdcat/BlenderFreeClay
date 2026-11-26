@@ -36,6 +36,8 @@ class Reducer:
             self.bm = None
             raise ValueError('FreeClay Reduce requires triangles; use Open as Clay (Copy) first')
         self.matrix = matrix_world.copy() if matrix_world is not None else None
+        self.inverse=self.matrix.inverted() if self.matrix is not None else None
+        self.x_scale=self.matrix.to_3x3().col[0].length if self.matrix is not None else 1.0
         if self.matrix is not None:
             self.bm.transform(self.matrix)
         self.bm.normal_update()
@@ -75,7 +77,7 @@ class Reducer:
 
     def _mirror_vertex(self,v):
         if v not in self._mirror_cache:
-            p=self.matrix.inverted()@v.co if self.matrix is not None else v.co.copy()
+            p=self.inverse@v.co if self.inverse is not None else v.co.copy()
             p.x=-p.x
             if self.matrix is not None:
                 p=self.matrix@p
@@ -86,8 +88,8 @@ class Reducer:
             # bounded by a fraction of the local edge length; never move vertices.
             tolerance=max(self._mirror_tolerance,min((e.calc_length() for e in v.link_edges),default=0)*.15)
             partner=None
-            if other.is_valid and distance<=tolerance:
-                back=self.matrix.inverted()@other.co if self.matrix is not None else other.co.copy()
+            if other.is_valid and distance<=tolerance and (other!=v or self._on_seam(v)):
+                back=self.inverse@other.co if self.inverse is not None else other.co.copy()
                 back.x=-back.x
                 if self.matrix is not None:
                     back=self.matrix@back
@@ -97,6 +99,39 @@ class Reducer:
             self._mirror_cache[v]=partner
         partner=self._mirror_cache[v]
         return partner if partner is not None and partner.is_valid else None
+
+    def _on_seam(self,v):
+        p=self.inverse@v.co if self.inverse is not None else v.co
+        return abs(p.x)*self.x_scale<=self._mirror_tolerance
+
+    def _pair_topology_safe(self,source,target,ms,mt):
+        """Validate the simultaneous quotient, including shared seam targets."""
+        if source==ms or source==mt or ms==target:return False
+        # Adjacent sources would change the same triangle in two places. Keep
+        # those cases conservative; the normal checks below are per source.
+        if any(ms in f.verts for f in source.link_faces):return False
+        mapping={source:target,ms:mt}
+        faces={f for v in (source,target,ms,mt) for f in v.link_faces}
+        triangles=set()
+        for face in faces:
+            triangle=frozenset(mapping.get(v,v) for v in face.verts)
+            if len(triangle)<3:continue
+            if triangle in triangles:return False
+            triangles.add(triangle)
+        for survivor in {target,mt}:
+            # A manifold interior vertex has a single closed link cycle.
+            link={}
+            for triangle in triangles:
+                if survivor not in triangle:continue
+                a,b=triangle-{survivor}
+                link.setdefault(a,set()).add(b);link.setdefault(b,set()).add(a)
+            if not link or any(len(neighbors)!=2 for neighbors in link.values()):return False
+            visited=set();pending=[next(iter(link))]
+            while pending:
+                v=pending.pop()
+                if v not in visited:visited.add(v);pending.extend(link[v]-visited)
+            if len(visited)!=len(link):return False
+        return True
 
     def _quadric(self, v):
         if v not in self.quadrics:
@@ -174,8 +209,23 @@ class Reducer:
         center, direction = Vector(center), Vector(view_direction).normalized()
         if radius <= 1e-10:
             return {'collapsed':0, 'milliseconds':0.0}
-        nearby = [(d,self.vertices[i]) for _,i,d in self.tree.find_range(center,radius)
+        query_center=center;query_radius=radius;segment=None
+        if mirror_x:
+            local=self.inverse@center if self.inverse is not None else center.copy()
+            if 2*abs(local.x)*self.x_scale<=radius:
+                local.x=-local.x
+                other=self.matrix@local if self.matrix is not None else local
+                axis=other-center
+                segment=(axis,axis.length_squared)
+                query_center=(center+other)*.5;query_radius=radius+axis.length*.5
+        def brush_distance(p):
+            offset=p-center
+            if segment and segment[1]>1e-20:
+                offset-=segment[0]*max(0,min(1,offset.dot(segment[0])/segment[1]))
+            return offset.length
+        nearby = [(brush_distance(self.vertices[i].co),self.vertices[i]) for _,i,_ in self.tree.find_range(query_center,query_radius)
                   if self.vertices[i].is_valid]
+        nearby=[(d,v) for d,v in nearby if d<=radius]
         if not nearby:
             return {'collapsed':0, 'milliseconds':0.0}
         # Surface connectivity keeps a second shell behind the stroke untouched.
@@ -203,13 +253,16 @@ class Reducer:
         ranked = []
         for e in edges:
             a,b = e.verts
-            distance = max((a.co-center).length,(b.co-center).length)/radius
+            distance = max(brush_distance(a.co),brush_distance(b.co))/radius
             falloff = (1-distance*distance)**2
             if falloff < 0.015 or e.calc_length() > target_length*math.sqrt(falloff):
                 continue
             q = quadric_add(self._quadric(a),self._quadric(b))
             ca, cb = quadric_cost(q,a.co), quadric_cost(q,b.co)
             cost, target, source = (ca,a,b) if ca<=cb else (cb,b,a)
+            if mirror_x and self._on_seam(a)!=self._on_seam(b):
+                # Preserve the plane, but allow each side to collapse INTO it.
+                cost,target,source=(ca,a,b) if self._on_seam(a) else (cb,b,a)
             local_tol = tolerance*(0.35+0.65*falloff)
             if cost <= local_tol*local_tol:
                 # Stable geometry-based tie-breaks make mirror sides reproducible.
@@ -241,18 +294,22 @@ class Reducer:
                     continue
                 if ms!=source or mt!=target:
                     mirror_ring={ms,mt}|{e.other_vert(v) for v in (ms,mt) for e in v.link_edges}
-                    # Crossing or touching the symmetry seam is kept conservative.
-                    if mirror_ring & (used|ring) or is_protected(ms) or is_protected(mt):
+                    if mirror_ring & used or is_protected(ms) or is_protected(mt):
                         continue
                     mq=quadric_add(self._quadric(ms),self._quadric(mt))
                     if quadric_cost(mq,mt.co)>tol*tol or not self._safe(ms,mt,tol):
+                        continue
+                    if mirror_ring & ring and not self._pair_topology_safe(source,target,ms,mt):
                         continue
                     partners=[(ms,mt,mq)]
                     ring.update(mirror_ring)
             weld[source] = target
             updates[target] = q
             for ms,mt,mq in partners:
-                weld[ms]=mt; updates[mt]=mq
+                weld[ms]=mt
+                # A seam target can receive both sources. Count its old quadric
+                # once, retaining all three sets of original surface planes.
+                updates[mt]=quadric_add(q,self._quadric(ms)) if mt==target else mq
             used.update(ring)
         if weld:
             # Freeze all original planes that this batch is about to change,

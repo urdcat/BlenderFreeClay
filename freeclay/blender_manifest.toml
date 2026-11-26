@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "freeclay"
-version = "0.1.4"
+version = "0.1.7"
 name = "FreeClay — Gentle Reduce"
 tagline = "Brush away excess topology while keeping your clay's shape"
 maintainer = "FreeClay prototype"
