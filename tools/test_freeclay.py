@@ -105,10 +105,29 @@ def test_scale_cancel_and_session():
     area=next(a for a in window.screen.areas if a.type=='VIEW_3D')
     region=next(r for r in area.regions if r.type=='WINDOW')
     with bpy.context.temp_override(window=window,area=area,region=region):
+        space=area.spaces.active
+        space.shading.type='WIREFRAME'
+        space.overlay.show_overlays=False
+        space.overlay.wireframe_opacity=.7
+        display_names=('show_stats','show_overlays','show_wireframes','wireframe_threshold','wireframe_opacity')
+        display_before={name:getattr(space.overlay,name) for name in display_names}
         result=bpy.ops.freeclay.open_clay(new_sphere=True)
         assert result=={'FINISHED'},result
         obj=bpy.context.object
         assert obj.mode=='SCULPT' and obj.get('freeclay_enabled')
+        assert space.shading.type=='SOLID' and space.overlay.show_stats and space.overlay.show_overlays
+        # Emulate upgrading a saved 0.1.2 session, which lacks the new keys.
+        saved=json.loads(obj['freeclay_view_before'])
+        saved.pop('overlay.wireframe_opacity')
+        obj['freeclay_view_before']=json.dumps(saved)
+        bpy.ops.freeclay.display(kind='WIRE')
+        assert space.overlay.show_wireframes and abs(space.overlay.wireframe_opacity-.35)<1e-6
+        bpy.ops.freeclay.display(kind='WIRE')
+        assert not space.overlay.show_wireframes
+        bpy.ops.freeclay.display(kind='STATS')
+        assert not space.overlay.show_stats
+        bpy.ops.freeclay.display(kind='STATS')
+        assert space.overlay.show_stats
         for kind in ('GRAB','SMOOTH','CREASE','DRAW','REDUCE'):
             assert bpy.ops.freeclay.brush(kind=kind)=={'FINISHED'}
         obj.scale=(1.2,.8,1.5)
@@ -132,6 +151,9 @@ def test_scale_cancel_and_session():
         # Save only this owned factory process, never the user's editing session.
         bpy.ops.wm.save_as_mainfile(filepath=str(ROOT/'verification'/'test-session.blend'))
         assert bpy.ops.freeclay.leave()=={'FINISHED'}
+        assert space.shading.type=='WIREFRAME'
+        assert {name:getattr(space.overlay,name) for name in display_names}==display_before
+        report['tests'].append({'name':'wire and live stats toggles, old session compatibility, display restoration','passed':True})
         bpy.ops.mesh.primitive_cube_add()
         source=bpy.context.object
         source.name='Untouched Source'

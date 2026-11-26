@@ -1,5 +1,5 @@
 """Synthetic input via Blender's own API, on a worker-owned inactive desktop."""
-import bpy, sys, pathlib, json, traceback, time
+import bpy, sys, pathlib, json, traceback, time, re
 from mathutils import Quaternion, Vector
 from bpy_extras.view3d_utils import location_3d_to_region_2d
 ROOT=pathlib.Path(__file__).resolve().parents[1]
@@ -66,8 +66,16 @@ def tick():
                     return result
                 freeclay.FREECLAY_OT_reduce.invoke=traced_invoke
                 freeclay.register()
+                # Factory startup can already contain Sculpt settings. A genuinely
+                # new scene reproduces the first-use state from the reported error.
+                window.scene=bpy.data.scenes.new('FreeClay first-use GUI')
+                assert bpy.context.scene.tool_settings.sculpt is None
+                report['checks'].append({'sculpt_settings_initially_none':True})
                 bpy.ops.object.select_all(action='SELECT'); bpy.ops.object.delete(use_global=False)
                 bpy.ops.freeclay.open_clay(new_sphere=True)
+                assert area.spaces.active.overlay.show_stats
+                bpy.ops.freeclay.display(kind='WIRE')
+                assert area.spaces.active.shading.type=='SOLID' and area.spaces.active.overlay.show_wireframes
                 obj=bpy.context.object; obj_name=obj.name
                 initial=len(obj.data.polygons)
                 rv.view_rotation=Quaternion((1,0,0,0))
@@ -95,6 +103,13 @@ def tick():
                 x,y=points[0]
                 window.event_simulate(type='LEFTMOUSE',value='PRESS',x=x,y=y)
             elif 3<=step<28:
+                if step==20:
+                    live_stats=bpy.context.scene.statistics(bpy.context.view_layer)
+                    assert int(re.search(r'Faces:([\d,]+)',live_stats).group(1).replace(',',''))==len(bpy.context.object.data.polygons)
+                    assert len(bpy.context.object.data.polygons)<initial
+                    report['checks'].append({'reduce_live_statistics':live_stats,
+                                            'faces':len(bpy.context.object.data.polygons)})
+                    bpy.ops.screen.screenshot(filepath=str(out/'reduce-live-stats.png'))
                 if step==4:
                     report['checks'].append({'during_drag_mode':bpy.context.object.mode,
                                             'active_strokes':len(freeclay._active_strokes)})
@@ -157,6 +172,12 @@ def tick():
                 x,y=points[0]
                 window.event_simulate(type='LEFTMOUSE',value='PRESS',x=x,y=y)
             elif 45<=step<55:
+                if step==53:
+                    live_stats=bpy.context.scene.statistics(bpy.context.view_layer)
+                    assert int(re.search(r'Tris:([\d,]+)',live_stats).group(1).replace(',',''))>reduced
+                    report['checks'].append({'dyntopo_live_statistics':live_stats,
+                                            'dyntopo':bpy.context.object.use_dynamic_topology_sculpting})
+                    bpy.ops.screen.screenshot(filepath=str(out/'dyntopo-live-stats.png'))
                 x,y=points[(step-45)*2]
                 window.event_simulate(type='MOUSEMOVE',value='NOTHING',x=x,y=y)
             elif step==55:

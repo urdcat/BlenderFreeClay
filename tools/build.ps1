@@ -6,7 +6,7 @@ $dist=Join-Path $projectRoot 'dist'
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $projectRoot 'verification') | Out-Null
 $files=@('__init__.py','reducer.py','grab.py','blender_manifest.toml','LICENSE.txt') | ForEach-Object { Join-Path (Join-Path $projectRoot 'freeclay') $_ }
-$archive=Join-Path $dist 'freeclay-0.1.2.zip'
+$archive=Join-Path $dist 'freeclay-0.1.4.zip'
 Compress-Archive -LiteralPath $files -DestinationPath $archive -Force
 & $Blender --background --factory-startup --command extension validate $archive
 if($LASTEXITCODE -ne 0){throw 'Blender extension validation failed'}

@@ -1,6 +1,6 @@
 """FreeClay: a small, reversible clay workspace and conservative Reduce brush."""
 bl_info = {'name':'FreeClay — Gentle Reduce', 'author':'FreeClay prototype',
-           'version':(0,1,2), 'blender':(5,2,0), 'category':'Sculpt',
+           'version':(0,1,4), 'blender':(5,2,0), 'category':'Sculpt',
            'description':'Paint away excess topology without smoothing your shape'}
 
 import math
@@ -183,13 +183,8 @@ class FREECLAY_OT_clay(bpy.types.Operator):
             old.select_set(False)
         obj.select_set(True)
         context.view_layer.objects.active=obj
-        obj['freeclay_enabled']=True
         context.view_layer.update()
         reference_diameter(obj)
-        sculpt=context.scene.tool_settings.sculpt
-        obj['freeclay_previous_symmetry']=[sculpt.use_symmetry_x,sculpt.use_symmetry_y,sculpt.use_symmetry_z]
-        obj['freeclay_previous_detail']=json.dumps({name:getattr(sculpt,name) for name in
-                                                   ('detail_type_method','detail_refine_method','detail_percent')})
         space=context.space_data
         saved={}
         saved['show_region_toolbar']=space.show_region_toolbar
@@ -199,6 +194,12 @@ class FREECLAY_OT_clay(bpy.types.Operator):
             bpy.ops.screen.region_toggle(region_type='ASSET_SHELF')
         for name in ('show_floor','show_axis_x','show_axis_y','show_stats','show_outline_selected'):
             saved['overlay.'+name]=getattr(space.overlay,name); setattr(space.overlay,name,False)
+        for name in ('show_overlays','show_wireframes','wireframe_threshold','wireframe_opacity'):
+            saved['overlay.'+name]=getattr(space.overlay,name)
+        saved['shading.type']=space.shading.type
+        space.shading.type='SOLID'
+        space.overlay.show_overlays=True
+        space.overlay.show_stats=True
         obj['freeclay_view_before']=json.dumps(saved)
         space.show_region_ui=True
         area=context.area
@@ -217,6 +218,12 @@ class FREECLAY_OT_clay(bpy.types.Operator):
         for face in mesh.polygons:
             face.use_smooth=True
         bpy.ops.object.mode_set(mode='SCULPT')
+        # New scenes have no Sculpt settings until Blender enters Sculpt mode.
+        sculpt=context.scene.tool_settings.sculpt
+        obj['freeclay_previous_symmetry']=[sculpt.use_symmetry_x,sculpt.use_symmetry_y,sculpt.use_symmetry_z]
+        obj['freeclay_previous_detail']=json.dumps({name:getattr(sculpt,name) for name in
+                                                   ('detail_type_method','detail_refine_method','detail_percent')})
+        obj['freeclay_enabled']=True
         # No preference changes; brushes, mode and keymaps are local to FreeClay.
         load_brush(context,'Draw','DRAW')
         sync_symmetry(context.scene.freeclay,context)
@@ -245,7 +252,8 @@ class FREECLAY_OT_leave(bpy.types.Operator):
         bpy.ops.wm.tool_set_by_id(name='builtin.brush')
         obj['freeclay_enabled']=False
         for key,value in json.loads(obj.get('freeclay_view_before','{}')).items():
-            owner=context.space_data.overlay if key.startswith('overlay.') else context.space_data
+            owner=(context.space_data.overlay if key.startswith('overlay.') else
+                   context.space_data.shading if key.startswith('shading.') else context.space_data)
             if key=='show_region_asset_shelf':
                 if owner.show_region_asset_shelf!=value:
                     bpy.ops.screen.region_toggle(region_type='ASSET_SHELF')
@@ -711,6 +719,40 @@ class FREECLAY_WST_grab(bpy.types.WorkSpaceTool):
             draw_circle_2d(xy,(1,.65,.25,.85),(b-a).length,segments=96)
 
 
+class FREECLAY_OT_display(bpy.types.Operator):
+    bl_idname='freeclay.display'
+    bl_label='表示を切り替える'
+    bl_description='ワイヤーの重ね表示、または頂点数・面数の表示を切り替えます'
+    kind: EnumProperty(items=[('WIRE','ソリッド＋ワイヤー',''),('STATS','頂点数・面数','')])
+
+    @classmethod
+    def poll(cls,context):
+        return context.area and context.area.type=='VIEW_3D' and owned(context)
+
+    def execute(self,context):
+        space=context.space_data
+        # Older saved FreeClay sessions did not capture these display settings.
+        saved=json.loads(context.object.get('freeclay_view_before','{}'))
+        for name in ('show_overlays','show_stats','show_wireframes','wireframe_threshold','wireframe_opacity'):
+            saved.setdefault('overlay.'+name,getattr(space.overlay,name))
+        saved.setdefault('shading.type',space.shading.type)
+        context.object['freeclay_view_before']=json.dumps(saved)
+        if self.kind=='WIRE':
+            enabled=not (space.overlay.show_wireframes and space.overlay.show_overlays and space.shading.type=='SOLID')
+            space.shading.type='SOLID'
+            space.overlay.show_wireframes=enabled
+            if enabled:
+                space.overlay.show_overlays=True
+                space.overlay.wireframe_threshold=1.0
+                space.overlay.wireframe_opacity=.35
+        else:
+            enabled=not (space.overlay.show_stats and space.overlay.show_overlays)
+            space.overlay.show_stats=enabled
+            if enabled:space.overlay.show_overlays=True
+        context.area.tag_redraw()
+        return {'FINISHED'}
+
+
 class FREECLAY_PT_panel(bpy.types.Panel):
     bl_label='FreeClay'
     bl_idname='FREECLAY_PT_panel'
@@ -720,7 +762,7 @@ class FREECLAY_PT_panel(bpy.types.Panel):
 
     def draw(self,context):
         layout=self.layout
-        if not owned(context):
+        if not owned(context) or not context.object.get('freeclay_previous_detail'):
             layout.label(text='触って、形をつくる。')
             layout.operator('freeclay.open_clay',text='新しい粘土',icon='MESH_UVSPHERE').new_sphere=True
             layout.operator('freeclay.open_clay',icon='DUPLICATE')
@@ -731,6 +773,13 @@ class FREECLAY_PT_panel(bpy.types.Panel):
                            ('CREASE','溝  ·  C'),('REDUCE','軽くする  ·  Q')]:
             col.operator('freeclay.brush',text=label).kind=kind
         layout.separator()
+        space=context.space_data
+        box=layout.box()
+        box.label(text='表示')
+        box.operator('freeclay.display',text='ソリッド＋ワイヤー',icon='SHADING_WIRE',
+                     depress=space.overlay.show_overlays and space.overlay.show_wireframes and space.shading.type=='SOLID').kind='WIRE'
+        box.operator('freeclay.display',text='頂点数・面数',icon='INFO',
+                     depress=space.overlay.show_overlays and space.overlay.show_stats).kind='STATS'
         s=context.scene.freeclay
         box=layout.box()
         box.label(text='Grab · つかむ')
@@ -776,7 +825,7 @@ class FREECLAY_OT_menu(bpy.types.Operator):
 _classes=(FreeClaySettings,FREECLAY_OT_brush,FREECLAY_OT_clay,FREECLAY_OT_leave,
           FREECLAY_OT_reduce,FREECLAY_OT_navigate,FREECLAY_PT_panel,FREECLAY_MT_brushes,FREECLAY_OT_menu,
           FREECLAY_OT_sculpt_stroke)
-_classes=_classes+(FREECLAY_OT_symmetrize,FREECLAY_OT_grab)
+_classes=_classes+(FREECLAY_OT_symmetrize,FREECLAY_OT_grab,FREECLAY_OT_display)
 
 
 def register():
